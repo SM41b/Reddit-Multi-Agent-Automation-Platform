@@ -14,6 +14,10 @@ from loguru import logger
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 import os
+from core.reddit_platform_startup import init_reddit_platform, shutdown_reddit_platform
+from api.reddit_workflow_api import router as reddit_router
+from api.reddit_dashboard_ws import router as reddit_ws_router
+
 
 # Load environment variables
 env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../.env'))
@@ -92,6 +96,9 @@ async def lifespan(app: FastAPI):
     agent_service = AgentService(orchestrator, orchestrator.memory_manager)
     report_service = ReportService(orchestrator, orchestrator.memory_manager)
     langgraph_orchestrator = LangGraphOrchestrator(orchestrator.agents)
+
+    # Reddit orchestrator platform         
+    await init_reddit_platform(app)
     
     yield
     
@@ -101,6 +108,9 @@ async def lifespan(app: FastAPI):
     
     # Shutdown queue system
     await queue_manager.stop_all()
+
+     # Reddit orchestrator platform         
+    await shutdown_reddit_platform(app)
 
 app = FastAPI(
     title="AgentFlow API",
@@ -128,6 +138,10 @@ app.include_router(integrations_router)
 # Include PRD compliance router
 from api.prd_compliance_api import router as prd_router
 app.include_router(prd_router)
+
+# Include Reddit orchestrator router          
+app.include_router(reddit_router)    
+app.include_router(reddit_ws_router)  
 
 # Request models
 class AuthRequest(BaseModel):

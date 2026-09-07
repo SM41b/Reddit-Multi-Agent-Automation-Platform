@@ -1,10 +1,8 @@
-# Multi Agent for Business Automation
+# Reddit Multi-Agent Automation Platform
 
-**Multi Agent for Business Automation** is a multi-agent orchestration platform for business automation and decision support. It coordinates specialized AI agents—each with distinct roles, personalities, and tools—through LangGraph workflows, shared memory, and human-in-the-loop (HITL) approval gates.
+**Reddit Multi-Agent Automation Platform** is a multi-persona orchestration system for managing authorized Reddit accounts through specialized AI agents. It coordinates Research, Content, and Analysis agents through a LangGraph workflow with human-in-the-loop (HITL) approval gates, and enforces human-like posting behavior through a dedicated behavior-profile/jitter layer — so activity stays clearly non-automated in pattern even though it's agent-driven.
 
-The system targets end-to-end business workflows: vision capture, planning, domain analysis (finance, marketing, legal), report generation, and optional integrations with CRM and social channels.
-
-![AgentFlow workflow — from user vision through specialist agents, HITL approval, shared memory, and outputs](img/workflow.png)
+Reddit is the pilot platform. The architecture is designed to extend to additional social platforms later without restructuring the core orchestration layer.
 
 ---
 
@@ -12,36 +10,37 @@ The system targets end-to-end business workflows: vision capture, planning, doma
 
 | Layer | Description |
 |-------|-------------|
-| **Frontend** | React 18 + Vite dashboard with chat onboarding, agent status, task flow visualization, and PRD compliance views |
-| **API** | FastAPI backend with REST endpoints, WebSocket streaming, and modular route controllers |
-| **Orchestration** | LangGraph state machines with checkpointing, self-correction, and HITL interrupt nodes |
-| **Agents** | Role-specific agents (Cofounder, Manager, Finance, Marketing, Legal, Money, Sales) backed by personality profiles |
-| **Memory** | Neo4j graph memory, Qdrant vector search, Redis/Upstash task queues, and multi-level local caching |
-| **Integrations** | HubSpot CRM, Slack notifications, Instagram marketing (with compliance engine) |
+| **Frontend** | React + Vite dashboard with live persona status, an approval queue, and a websocket-driven activity feed |
+| **API** | FastAPI backend — persona management, workflow execution, and approval endpoints |
+| **Orchestration** | LangGraph state machine (`HITLRedditOrchestrator`) with checkpointing and an explicit human-approval interrupt |
+| **Agents** | Research, Content, and Analysis agents, each scoped per persona |
+| **Task execution** | Redis-backed BullMQ queue — workflow runs execute out-of-band, not inline in the request |
+| **Memory** | PostgreSQL for approvals/audit logs, Redis for behavior-profile state and the task queue |
+| **Integrations** | Reddit API (via asyncpraw) |
+| **Compliance** | Per-persona behavior-profile manager enforcing jittered posting intervals, hourly/daily caps, and active-hours windows |
 
 ---
 
+## Workflow model
 
-### Workflow model
-
-1. **Vision intake** — The Cofounder agent captures and structures the user's project vision.
-2. **Planning** — The Manager agent produces a roadmap and delegates tasks across domain agents.
-3. **Domain execution** — Finance, Marketing, Legal, and other agents run in parallel or sequence as defined by the orchestrator.
-4. **Quality & approval** — Confidence scoring and HITL checkpoints pause execution when human review is required.
-5. **Output** — Results are persisted to shared memory, surfaced in the dashboard, and exported as HTML/PDF reports.
+1. **Persona setup** — An authorized Reddit account is registered as a persona, with its own credentials, personality traits, and default subreddit.
+2. **Research** — The Research agent gathers subreddit context and synthesizes a research brief. Read-only; rarely requires approval.
+3. **Content drafting** — The Content agent drafts a post or comment reply grounded in the research. Any Reddit-facing output from this agent is approval-gated by default.
+4. **Analysis** — The Analysis agent reviews the draft against the research for tone, relevance, and risk flags before the checkpoint decides.
+5. **HITL checkpoint** — Confidence score, action type, and a live behavior-profile check (jitter/rate-limit/active-hours) jointly decide whether the run proceeds automatically or pauses for a human.
+6. **Human approval** — If paused, the run sits at the `approval_gate` interrupt until a human approves or rejects it from the dashboard.
+7. **Execution** — On approval, the side-effects step calls the Reddit API and records the action against that persona's behavior profile, so future rate-limit checks reflect real activity.
 
 ---
 
 ## Features
 
-- **Specialized agents** with configurable personality profiles (temperature, confidence thresholds, role tools)
-- **LangGraph orchestration** with state checkpointing, error recovery, and execution path tracking
-- **Human-in-the-loop** approval flows with Slack notification hooks and timeout configuration
-- **Unified memory** — graph relationships (Neo4j), semantic retrieval (Qdrant), and Redis-backed task queues with in-memory fallback
-- **Real-time monitoring** — agent status, live logs, task flow visualization, and morning brief summaries
-- **Report generation** — executive, marketing, financial, and comprehensive reports (JSON + PDF via WeasyPrint)
-- **External integrations** — HubSpot CRM, Slack HITL channels, Instagram Business API with compliance checks
-- **Demo mode** — local development without Supabase or external API keys (`DEMO_MODE=true`)
+- **Per-persona orchestration** — each authorized Reddit account gets its own agent set and LangGraph orchestrator instance, since Reddit's OAuth session is single-account per client
+- **LangGraph HITL orchestration** with explicit `interrupt_before`/`interrupt_after` nodes, not polling-based approval
+- **Behavior-profile compliance layer** — minimum jittered gaps between actions, hourly/daily action caps, and active-hours windows, tracked per persona in Redis
+- **Human approval queue** — pending approvals surfaced via REST and pushed live over a websocket bridge
+- **Queue-backed execution** — workflow runs are enqueued (BullMQ/Redis) rather than blocking on an open HTTP request, since a run can pause indefinitely awaiting a human
+- **Audit logging** — every side-effect execution is logged to PostgreSQL with the acting agent, persona, and payload
 
 ---
 
@@ -50,21 +49,24 @@ The system targets end-to-end business workflows: vision capture, planning, doma
 | Category | Technologies |
 |----------|--------------|
 | Backend | Python 3.9+, FastAPI, Uvicorn, Pydantic v2 |
-| Agent framework | LangGraph, LangChain, CrewAI |
-| LLM access | OpenRouter (primary), OpenAI, Google; mock provider for offline dev |
-| Databases | Neo4j 5.x, Qdrant, Redis 7 / Upstash |
-| Auth & persistence | Supabase (optional) |
-| Frontend | React 18, Vite 5, React Router 6, Tailwind CSS, Recharts, React Flow |
-| Tooling | Crawl4AI, Sentence Transformers, WeasyPrint, Matplotlib |
+| Agent framework | LangGraph |
+| LLM access | Anthropic / OpenAI (via the existing `llm_service`) |
+| Databases | PostgreSQL (approvals, audit logs), Redis (behavior profiles, task queue) |
+| Task queue | BullMQ (Python) on Redis |
+| Reddit integration | asyncpraw |
+| Frontend | React, Vite, Tailwind CSS, lucide-react |
+| Real-time | Native WebSocket, bridged from an in-process event bus |
 
 ---
 
 ## Prerequisites
 
 - **Python** 3.9 or later
-- **Node.js** 18+ and **pnpm** (or npm)
-- **Docker Desktop** (recommended for Neo4j, Qdrant, and Redis)
-- At least one **LLM API key** (OpenRouter recommended) for non-mock inference
+- **Node.js** 18+ and npm/pnpm
+- **PostgreSQL** (for approvals and audit logs)
+- **Redis** (for behavior-profile tracking and the task queue)
+- At least one **LLM API key** (Anthropic or OpenAI)
+- A **Reddit "script" app** per persona — create at [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps) to get a `client_id`/`client_secret`
 
 ---
 
@@ -73,42 +75,27 @@ The system targets end-to-end business workflows: vision capture, planning, doma
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/luckup/agentflow.git
-cd agentflow
+git clone https://github.com/SM41b/Reddit-Multi-Agent-Platform.git
+cd Reddit-Multi-Agent-Platform
 ```
 
-### 2. Start infrastructure services
-
-Docker Compose provisions Neo4j, Qdrant, and Redis locally:
-
-```bash
-docker compose up -d
-```
-
-Default Neo4j credentials in `docker-compose.yml`: `neo4j` / `agentflow123`.
-
-### 3. Configure the backend
+### 2. Configure the backend
 
 ```bash
 cd backend
 cp .env.example .env
 ```
 
-Edit `.env` with your keys. For local exploration, keep demo mode enabled:
+Edit `.env`:
 
 ```env
-DEMO_MODE=true
-OPENROUTER_API_KEY=your_key_here
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=agentflow123
-QDRANT_URL=http://localhost:6333
+DATABASE_URL=postgresql://user:password@localhost:5432/reddit_platform
+REDIS_URL=redis://localhost:6379
+ANTHROPIC_API_KEY=your_key_here
 PORT=8000
 ```
 
-For production-style integrations (Instagram, Slack, HubSpot, Upstash), see `backend/.env.prd.example`.
-
-### 4. Install and run the backend
+### 3. Install and run the backend
 
 ```bash
 python -m venv venv
@@ -123,21 +110,34 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The API starts at **http://localhost:8000**. Open **http://localhost:8000/docs** for the interactive OpenAPI reference.
+The API starts at **http://localhost:8000**. Interactive docs at **http://localhost:8000/docs**.
 
-> **Note:** `backend/api/main.py` is a slimmer API entry point with a subset of routes. The full application surface is served by `backend/main.py`.
-
-### 5. Install and run the frontend
+### 4. Install and run the frontend
 
 In a separate terminal:
 
 ```bash
 cd frontend
-pnpm install
-pnpm dev
+npm install
+npm run dev
 ```
 
-The UI is available at **http://localhost:5173**. Vite proxies `/api` requests to the backend on port 8000.
+The UI is available at **http://localhost:5173**.
+
+### 5. Register a persona
+
+```bash
+curl -X POST http://localhost:8000/api/personas \
+  -H "Content-Type: application/json" \
+  -d '{
+    "persona_id": "persona_alpha",
+    "reddit_client_id": "...",
+    "reddit_client_secret": "...",
+    "reddit_username": "...",
+    "reddit_password": "...",
+    "default_subreddit": "some_subreddit"
+  }'
+```
 
 ---
 
@@ -145,141 +145,89 @@ The UI is available at **http://localhost:5173**. Vite proxies `/api` requests t
 
 | Variable | Purpose |
 |----------|---------|
-| `DEMO_MODE` | Bypass Supabase; use in-memory auth for local dev |
-| `OPENROUTER_API_KEY` | Primary LLM provider |
-| `OPENAI_API_KEY` / `GOOGLE_API_KEY` | Fallback LLM providers |
-| `SUPABASE_URL` / `SUPABASE_KEY` | Production authentication |
-| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | Graph memory |
-| `QDRANT_URL` / `QDRANT_API_KEY` | Vector memory |
-| `REDIS_URL` / `UPSTASH_REDIS_REST_*` | Task queue and caching |
-| `HUBSPOT_ACCESS_TOKEN` | CRM integration |
-| `SLACK_BOT_TOKEN` | HITL and notification channels |
-| `INSTAGRAM_ACCESS_TOKEN` | Marketing automation |
+| `DATABASE_URL` | PostgreSQL connection string for approvals and audit logs |
+| `REDIS_URL` | Redis connection string for behavior-profile tracking and the task queue |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | LLM provider for agent reasoning |
 
-Memory and queue subsystems degrade gracefully when external services are unavailable—Redis falls back to an in-memory adapter, and LLM calls can use the mock provider.
+Reddit credentials are supplied per-persona through the `/api/personas` endpoint, not as global environment variables — this is a multi-account platform, not a single-account bot.
 
 ---
 
 ## API Surface
 
-Key endpoint groups (full list in `/docs`):
-
-| Prefix | Description |
-|--------|-------------|
-| `/api/auth/*` | Sign up, sign in, user profile |
-| `/api/projects`, `/api/start-project` | Project lifecycle |
-| `/api/enhanced/*` | Session-based agent workflows with live logs |
-| `/api/agents/*` | Agent listing and status |
-| `/api/approvals/*` | Pending HITL approvals |
-| `/api/conversation/*` | Direct agent chat |
-| `/api/reports/*` | Report generation and PDF download |
-| `/api/memory/*` | Graph export and memory statistics |
-| `/api/analytics/*` | Predictions and analytics |
-| `/api/integrations/*` | HubSpot, Slack, Instagram |
-| `/api/prd/*` | PRD compliance checks |
-| `/api/morning-brief/*` | Daily brief generation |
-| `/api/shared-context/*` | Cross-agent shared context |
-| WebSocket | Real-time agent logs and status streams |
+| Endpoint | Description |
+|----------|--------------|
+| `POST /api/personas` | Register and authenticate a new persona |
+| `GET /api/personas/{persona_id}/status` | Agent statuses for a persona |
+| `POST /api/workflow/{persona_id}/start` | Enqueue a Research → Content → Analysis run |
+| `GET /api/workflow/{persona_id}/jobs/{job_id}` | Poll a queued run's status/result |
+| `GET /api/workflow/{persona_id}/approvals` | List pending approvals for a persona |
+| `POST /api/workflow/{persona_id}/approvals/{approval_id}/respond` | Approve or reject a pending action, resuming the run |
+| `WS /ws/reddit-dashboard` | Live feed of agent completions and approval-needed events |
 
 ---
 
 ## Agent Roster
 
-Each agent is defined in `backend/agents/personalities.py` with traits, communication style, expertise areas, and role-specific tools.
+| Agent | Role | Approval bar |
+|-------|------|--------------|
+| **Research** | Gathers subreddit/topic context, synthesizes a research brief | Low — read-only |
+| **Content** | Drafts the Reddit post or comment reply | High — the only agent whose output can trigger a real Reddit side effect |
+| **Analysis** | Reviews the draft against research for tone, relevance, and risk flags | Low — advisory to the checkpoint |
 
-| Agent | Focus |
-|-------|-------|
-| **Cofounder** | Vision, strategy, market opportunity |
-| **Manager** | Roadmapping, task delegation, coordination |
-| **Finance** | Financial modeling, ROI, budgeting |
-| **Marketing** | Content strategy, brand, campaigns |
-| **Legal** | Compliance, contracts, risk |
-| **Money** | Revenue operations, pricing |
-| **Sales** | Pipeline, outreach, forecasting |
-
-The HITL orchestrator (`backend/workflows/hitl_langgraph_orchestrator.py`) maps PRD-aligned roles—Executive Advisor, Chief of Staff, Marketing Intelligence, Customer Success, Financial Operations, and Business Intelligence—to approval checkpoints.
+The HITL orchestrator (`backend/workflows/hitl_reddit_orchestrator.py`) routes all three through a single `hitl_checkpoint` node, which combines each agent's confidence score with a live behavior-profile check before deciding whether to auto-proceed or pause for a human.
 
 ---
 
 ## Project Structure
 
 ```
-agentflow/
+Reddit-Multi-Agent-Platform/
 ├── backend/
-│   ├── main.py                 # Primary FastAPI application
-│   ├── api/                    # Route controllers
-│   ├── agents/                 # Agent implementations and personalities
-│   ├── workflows/              # LangGraph and HITL orchestrators
-│   ├── flows/                  # PRD DAG orchestrator
-│   ├── memory/                 # Graph, vector, and cache managers
-│   ├── task_queue/             # Redis/Upstash queue with fallback
-│   ├── integrations/           # HubSpot, Slack, Instagram clients
-│   ├── approvals/              # HITL approval managers
-│   ├── collaboration/          # Cross-agent communication
-│   ├── outputs/                # Report and document generation
-│   ├── analytics/              # Predictions and metrics
-│   ├── auth/                   # Supabase authentication
-│   ├── services/               # LLM, agent, and report services
-│   ├── tools/                  # Web search and dynamic tool registry
-│   └── data/                   # Runtime data and conversation logs
+│   ├── main.py                             # Primary FastAPI application
+│   ├── api/
+│   │   ├── reddit_workflow_api.py          # Persona/workflow/approval endpoints
+│   │   └── reddit_dashboard_ws.py          # WebSocket bridge to the dashboard
+│   ├── agents/
+│   │   ├── base_agent.py                   # Lightweight agent base (no memory-manager coupling)
+│   │   ├── research_agent.py
+│   │   ├── content_agent.py
+│   │   ├── analysis_agent.py
+│   │   ├── agent_factory.py                # Builds one agent set + orchestrator per persona
+│   │   └── behavior_profile_manager.py     # Jitter/rate-limit/active-hours compliance
+│   ├── workflows/
+│   │   └── hitl_reddit_orchestrator.py     # LangGraph HITL state machine
+│   ├── integrations/
+│   │   └── reddit_client.py                # Reddit API client (asyncpraw)
+│   ├── database/
+│   │   └── postgres_approvals.py           # Approval + audit log storage
+│   ├── communication/
+│   │   └── dashboard_notifier.py           # Publishes to the in-process event bus
+│   ├── task_queue/
+│   │   ├── queue_manager.py                # Generic BullMQ/Redis queue manager
+│   │   └── reddit_workflow_worker.py       # Runs orchestrator jobs off the queue
+│   └── core/
+│       └── reddit_platform_startup.py      # Wires all of the above together at app startup
 ├── frontend/
-│   ├── src/
-│   │   ├── App.jsx             # Auth-gated chat + dashboard shell
-│   │   ├── pages/              # Workflow, analytics, monitoring views
-│   │   ├── components/         # Dashboard, HITL, PRD, integration panels
-│   │   └── services/api.js     # HTTP client with retry and caching
-│   └── vite.config.js          # Dev server and API proxy
-├── docker-compose.yml          # Neo4j, Qdrant, Redis
-└── e2e_test.py                 # Playwright end-to-end test harness
-```
-
----
-
-## Development
-
-### Verify database connectivity
-
-```bash
-cd backend
-python test_db_connections.py
-python test_redis.py
-python test_shared_context_manager.py
-```
-
-### Run integration and auth tests
-
-```bash
-python test_auth.py
-python test_integrations.py
-python test_prd_compliance.py
-```
-
-### End-to-end UI test
-
-Requires Playwright and both servers running:
-
-```bash
-pip install playwright
-playwright install chromium
-python e2e_test.py
-```
-
-### Frontend build
-
-```bash
-cd frontend
-pnpm build
-pnpm preview
+│   └── src/
+│       ├── services/redditApi.js           # REST client for the endpoints above
+│       ├── components/
+│       │   ├── PersonaStatusPanel.jsx
+│       │   └── ApprovalQueue.jsx
+│       ├── pages/
+│       │   └── RedditDashboardPage.jsx     # Composes the panels + live websocket feed
+│       └── hooks/useWebSocket.ts           # Generic websocket hook
+└── docker-compose.yml                      # PostgreSQL, Redis
 ```
 
 ---
 
 ## Design Principles
 
-- **Graceful degradation** — External services (Redis, Qdrant, Neo4j, LLM providers) are optional at development time; fallbacks keep core flows runnable.
-- **Structured coordination** — LangGraph state machines replace ad-hoc agent chaining for reproducible workflows.
-- **Human oversight** — High-impact actions require explicit approval before execution.
-- **Shared context** — Agents read and write to a unified memory layer rather than isolated conversation histories.
+- **One orchestrator per persona** — Reddit's OAuth session is single-account per client, so each authorized account gets its own fully isolated agent set rather than sharing state across personas.
+- **Approval decisions are centralized** — only the orchestrator's `hitl_checkpoint` node makes approval calls; individual agents never gate their own actions, avoiding duplicated or conflicting approval logic.
+- **Compliance is structural, not advisory** — the behavior-profile manager can force a human review regardless of how confident an agent is in its own output.
+- **Queue-backed, not request-blocking** — a run that pauses for human approval can't sit on an open HTTP connection, so execution always goes through the task queue.
 
 ---
 

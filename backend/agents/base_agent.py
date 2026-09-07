@@ -1,241 +1,137 @@
+"""
+Lightweight base agent, replacing the reference repo's agents/base_agent.py.
+
+Two changes from the original:
+
+1. Dropped the hard dependency on memory.memory_manager.MemoryManager
+   (Neo4j + Qdrant). Your project runs Postgres + Redis, not a graph/vector
+   memory stack, and HITLRedditOrchestrator already passes each agent its
+   shared_context and previous_outputs directly through the task dict — so
+   agents don't need to fetch their own memory. If you later add real
+   cross-run memory, plug it in as an optional store rather than reviving
+   the Neo4j/Qdrant dependency.
+
+2. Dropped the agent-level approval_manager.create_approval_request() call
+   inside execute(). The original had every agent request its own approval
+   on low confidence — but HITLRedditOrchestrator's hitl_checkpoint node
+   already does that centrally, using this exact confidence score. Keeping
+   both would double up on approval logic. This class just returns
+   {"output": ..., "confidence": ...} and lets the orchestrator decide.
+
+services/llm_service.py is unchanged and reused as-is — it has no
+Supabase/Neo4j coupling.
+"""
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional, List
 from enum import Enum
 import asyncio
+import json
 from datetime import datetime
 from loguru import logger
-import json
 
-from memory.memory_manager import MemoryManager
-from tools.tool_registry import ToolRegistry
 from services.llm_service import llm_service, LLMProvider
+
 
 class AgentStatus(Enum):
     IDLE = "idle"
-    THINKING = "thinking"
     WORKING = "working"
-    WAITING_APPROVAL = "waiting_approval"
     COMPLETED = "completed"
     ERROR = "error"
 
+
 class BaseAgent(ABC):
-    """Base class for all AgentFlow agents"""
-    
-    def __init__(self, name: str, role: str, memory_manager: MemoryManager, approval_manager, personality: Optional[Dict[str, Any]] = None):
+    """Base class for Research/Content/Analysis agents.
+
+    Contract with HITLRedditOrchestrator: execute(task) -> Dict with at
+    least "output" (Dict) and "confidence" (float) keys. The orchestrator
+    handles retries at the workflow level via asyncio.wait_for + its own
+    error_handler node, but this class also retries at the agent level for
+    transient LLM failures, same as the original.
+    """
+
+    def __init__(self, name: str, role: str, personality: Optional[Dict[str, Any]] = None):
         self.name = name
         self.role = role
         self.personality = personality or {}
         self.status = AgentStatus.IDLE
-        self.confidence_threshold = self.personality.get("confidence_threshold", 0.8)
         self.retry_limit = self.personality.get("retry_limit", 3)
-        self.current_task = None
-        self.outputs = {}
-        
-        # Memory and approval systems
-        self.memory_manager = memory_manager
-        self.approval_manager = approval_manager
-        
-        # Tools - to be initialized by subclasses
-        self.tools = []
-        
+        self.current_task: Optional[Dict[str, Any]] = None
+        self.tools: List[Any] = []
         logger.info(f"Initialized {name} agent with role: {role}")
-    
+
     @abstractmethod
     async def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Process assigned task - implemented by each agent"""
-        pass
-    
+        """Do the actual work. Must return {"output": {...}, "confidence": float}."""
+        raise NotImplementedError
+
     def get_system_prompt(self) -> str:
-        """Get agent's system prompt based on personality"""
         return f"You are {self.name}, a {self.role}. {self.personality.get('description', '')}"
-    
+
     async def execute(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Main execution method with error handling and retries"""
+        """Called directly by HITLRedditOrchestrator._execute_agent()."""
         self.current_task = task
-        self.status = AgentStatus.THINKING
-        
+        self.status = AgentStatus.WORKING
+
+        last_error: Optional[Exception] = None
         for attempt in range(self.retry_limit):
             try:
                 logger.info(f"{self.name} starting task attempt {attempt + 1}")
-                
-                # Process the task
-                result = await self.process_task(task) # process_task will use self.tools._arun
-                
-                # Check confidence
-                confidence = result.get("confidence", 1.0)
-                if confidence < self.confidence_threshold:
-                    self.status = AgentStatus.WAITING_APPROVAL
-                    logger.warning(f"{self.name} low confidence ({confidence}), requesting approval")
-                    return await self._request_approval(result)
-                
-                # Store successful result
-                await self._store_result(result)
+                result = await self.process_task(task)
+                result.setdefault("agent", self.name)
+                result.setdefault("timestamp", datetime.now().isoformat())
                 self.status = AgentStatus.COMPLETED
-                self.outputs = result
-                
-                logger.info(f"{self.name} completed task successfully")
                 return result
-                
             except Exception as e:
+                last_error = e
                 logger.error(f"{self.name} attempt {attempt + 1} failed: {e}")
-                if attempt == self.retry_limit - 1:
-                    self.status = AgentStatus.ERROR
-                    return {"error": str(e), "agent": self.name}
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-    
-    async def _store_result(self, result: Dict[str, Any]):
-        """Store result with intelligent caching and minimal DB access"""
-        # Store detailed result in private memory
-        await self.memory_manager.store_agent_memory(
-            agent_name=self.name,
-            memory_type="task_result",
-            content=result,
-            is_shared=False,
-            metadata={
-                "task_id": self.current_task.get("id"),
-                "confidence": result.get("confidence", 1.0)
-            }
-        )
-        
-        # Store key outputs - memory manager will decide if global context worthy
-        if "output" in result:
-            await self.memory_manager.store_agent_memory(
-                agent_name=self.name,
-                memory_type=f"{self.name.lower()}_output",
-                content=result["output"],
-                is_shared=True,  # Let memory manager decide based on importance
-                confidence=result.get("confidence", 1.0),
-                metadata={
-                    "task_id": self.current_task.get("id"),
-                    "timestamp": datetime.now().isoformat(),
-                    "critical": result.get("confidence", 0) > 0.8
-                }
-            )
-    
-    async def _request_approval(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Request human approval for low-confidence results"""
-        approval_id = await self.approval_manager.create_approval_request(
-            agent_name=self.name,
-            action_type="task_completion",
-            content=result,
-            reason=f"Low confidence: {result.get('confidence', 0)}"
-        )
-        
-        return {
-            "status": "pending_approval",
-            "approval_id": approval_id,
-            "result": result
-        }
-    
-    async def _get_shared_context(self) -> Dict[str, Any]:
-        """Get current shared context with optimized caching"""
-        # Memory manager handles caching automatically
-        return await self.memory_manager.get_shared_context()
-    
-    async def _search_knowledge(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
-        """Search semantic knowledge base with caching"""
-        # Memory manager handles caching and event-driven DB access
-        return await self.memory_manager.semantic_search(
-            query=query,
-            agent_name=self.name,
-            limit=limit
-        )
-    
-    async def _log_error(self, message: str):
-        """Log error message"""
-        logger.error(f"{self.name}: {message}")
-        await self.memory_manager.store_agent_memory(
-            agent_name=self.name,
-            memory_type="error_log",
-            content={"message": message, "timestamp": datetime.now().isoformat()},
-            is_shared=False
-        )
-    
+                if attempt < self.retry_limit - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+        self.status = AgentStatus.ERROR
+        return {"output": {}, "confidence": 0.0, "agent": self.name, "error": str(last_error)}
+
     def get_status(self) -> Dict[str, Any]:
-        """Get current agent status"""
         return {
             "name": self.name,
             "role": self.role,
             "status": self.status.value,
-            "current_task": self.current_task.get("id") if self.current_task else None,
-            "outputs_ready": bool(self.outputs)
+            "current_task": (self.current_task or {}).get("id"),
         }
-    
-    async def _generate_response(
-        self, 
-        prompt: str, 
-        context: Optional[Dict[str, Any]] = None,
-        temperature: float = 0.7
-    ) -> Dict[str, Any]:
-        """Generate LLM response with structured output"""
-        
-        # Build system message
-        system_message = self.get_system_prompt()
-        
-        # Get shared context if available
-        if context is None:
-            context = await self._get_shared_context()
-        
-        # Build messages
+
+    # --- Shared LLM helper -------------------------------------------
+
+    async def _generate(self, prompt: str, context: Optional[Dict[str, Any]] = None,
+                         temperature: float = 0.7) -> Dict[str, Any]:
+        """Call the LLM and parse a structured response. context here is the
+        task's shared_context/previous_outputs, passed explicitly by the
+        subclass — not fetched from a memory manager."""
         messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": self._build_prompt(prompt, context)}
+            {"role": "system", "content": self.get_system_prompt()},
+            {"role": "user", "content": self._build_prompt(prompt, context or {})},
         ]
-        
         try:
-            # Generate response
             response = await llm_service.generate_response(
                 messages=messages,
                 agent_name=self.name,
                 temperature=temperature,
                 max_tokens=4000,
-                preferred_provider=LLMProvider.OPENROUTER
+                preferred_provider=LLMProvider.ANTHROPIC,
             )
-            
-            # Parse structured response
             return self._parse_response(response.content, response.confidence)
-            
         except Exception as e:
             logger.error(f"{self.name} LLM generation failed: {e}")
-            return {
-                "error": str(e),
-                "confidence": 0.0,
-                "content": "Unable to generate response"
-            }
-    
+            return {"content": "", "confidence": 0.0, "error": str(e)}
+
     def _build_prompt(self, prompt: str, context: Dict[str, Any]) -> str:
-        """Build enhanced prompt with context"""
-        context_str = ""
-        if context:
-            context_str = f"\n\nContext:\n{json.dumps(context, indent=2)}"
-        
-        return f"{prompt}{context_str}\n\nPlease provide a structured response with confidence score."
-    
+        context_str = f"\n\nContext:\n{json.dumps(context, indent=2)}" if context else ""
+        return f"{prompt}{context_str}\n\nRespond with structured JSON and a confidence score."
+
     def _parse_response(self, content: str, confidence: float) -> Dict[str, Any]:
-        """Parse LLM response into structured format"""
-        
-        # Try to extract JSON if present
         try:
-            if '{' in content and '}' in content:
-                start = content.find('{')
-                end = content.rfind('}') + 1
-                json_str = content[start:end]
-                parsed = json.loads(json_str)
-                
-                return {
-                    "content": content,
-                    "structured_output": parsed,
-                    "confidence": confidence,
-                    "agent": self.name,
-                    "timestamp": datetime.now().isoformat()
-                }
-        except:
+            if "{" in content and "}" in content:
+                start, end = content.find("{"), content.rfind("}") + 1
+                parsed = json.loads(content[start:end])
+                return {"content": content, "structured_output": parsed, "confidence": confidence}
+        except Exception:
             pass
-        
-        # Default format
-        return {
-            "content": content,
-            "confidence": confidence,
-            "agent": self.name,
-            "timestamp": datetime.now().isoformat()
-        }
+        return {"content": content, "confidence": confidence}
