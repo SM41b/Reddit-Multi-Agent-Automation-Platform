@@ -135,9 +135,7 @@ app.include_router(memory_router)
 app.include_router(document_router)
 app.include_router(integrations_router)
 
-# Include PRD compliance router
-from api.prd_compliance_api import router as prd_router
-app.include_router(prd_router)
+
 
 # Include Reddit orchestrator router          
 app.include_router(reddit_router)    
